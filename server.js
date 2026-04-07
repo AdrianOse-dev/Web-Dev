@@ -65,6 +65,15 @@ const upload = multer({
 // -------------------- Auth / session --------------------
 const sessions = new Map();
 
+sessions.set("demo-token", {
+  user: {
+    id: 1,
+    displayName: "Admin User",
+    email: "admin@example.com",
+    role: "admin",
+  },
+});
+
 function hashPassword(password) {
   return crypto.createHash("sha256").update(password).digest("hex");
 }
@@ -249,6 +258,33 @@ app.post(
     }
   },
 );
+
+app.get("/attachments", async (req, res) => {
+  try {
+    const { targetType, targetId } = req.query;
+
+    if (!targetType || !targetId) {
+      return res
+        .status(400)
+        .json({ error: "targetType and targetId are required" });
+    }
+
+    if (targetType !== "post" && targetType !== "reply") {
+      return res
+        .status(400)
+        .json({ error: "targetType must be 'post' or 'reply'" });
+    }
+
+    const [rows] = await pool.query(
+      "SELECT * FROM attachments WHERE targetType = ? AND targetId = ? ORDER BY createdAt DESC",
+      [targetType, targetId],
+    );
+
+    res.status(200).json(rows);
+  } catch (err) {
+    res.status(500).json({ error: "Failed to list attachments - DB Error" });
+  }
+});
 
 // Sign in
 app.post(
@@ -1042,33 +1078,76 @@ app.get("/search", async (req, res) => {
 
     if (type === "text") {
       sql = `
-        SELECT 'post' AS resultType, p.id, p.title, p.body, p.authorId, p.channelId, p.createdAt
-        FROM posts p
-        WHERE (? = '' OR p.title LIKE ? OR p.body LIKE ?)
-        ${channelId ? "AND p.channelId = ?" : ""}
-        ORDER BY p.createdAt DESC
+        SELECT * FROM (
+          SELECT
+            'post' AS itemType,
+            p.id,
+            p.title,
+            p.body AS excerpt,
+            p.authorId,
+            p.createdAt
+          FROM posts p
+          WHERE (? = '' OR p.title LIKE ? OR p.body LIKE ?)
+          ${channelId ? "AND p.channelId = ?" : ""}
+
+          UNION ALL
+
+          SELECT
+            'reply' AS itemType,
+            r.id,
+            NULL AS title,
+            r.body AS excerpt,
+            r.authorId,
+            r.createdAt
+          FROM reply r
+          WHERE (? = '' OR r.body LIKE ?)
+        ) AS results
+        ORDER BY createdAt DESC
         LIMIT ? OFFSET ?
       `;
+
       params = [q, `%${q}%`, `%${q}%`];
       if (channelId) params.push(channelId);
-      params.push(limit, offset);
+      params.push(q, `%${q}%`, limit, offset);
     } else if (type === "author") {
       if (!authorId) {
         return res
           .status(400)
           .json({ error: "authorId is required for author search" });
       }
+
       sql = `
-        SELECT 'post' AS resultType, p.id, p.title, p.body, p.authorId, p.channelId, p.createdAt
-        FROM posts p
-        WHERE p.authorId = ?
-        ${channelId ? "AND p.channelId = ?" : ""}
-        ORDER BY p.createdAt DESC
+        SELECT * FROM (
+          SELECT
+            'post' AS itemType,
+            p.id,
+            p.title,
+            p.body AS excerpt,
+            p.authorId,
+            p.createdAt
+          FROM posts p
+          WHERE p.authorId = ?
+          ${channelId ? "AND p.channelId = ?" : ""}
+
+          UNION ALL
+
+          SELECT
+            'reply' AS itemType,
+            r.id,
+            NULL AS title,
+            r.body AS excerpt,
+            r.authorId,
+            r.createdAt
+          FROM reply r
+          WHERE r.authorId = ?
+        ) AS results
+        ORDER BY createdAt DESC
         LIMIT ? OFFSET ?
       `;
+
       params = [authorId];
       if (channelId) params.push(channelId);
-      params.push(limit, offset);
+      params.push(authorId, limit, offset);
     } else if (type === "most-posts") {
       sql = `
         SELECT u.id AS userId, u.displayName, COUNT(p.id) AS postCount
@@ -1091,20 +1170,35 @@ app.get("/search", async (req, res) => {
       params = [limit, offset];
     } else if (type === "highest-ranked") {
       sql = `
-        SELECT
-          p.id,
-          p.title,
-          p.body,
-          p.authorId,
-          p.channelId,
-          p.createdAt,
-          COALESCE(SUM(v.value), 0) AS score
-        FROM posts p
-        LEFT JOIN vote v
-          ON v.targetType = 'post' AND v.targetId = p.id
-        ${channelId ? "WHERE p.channelId = ?" : ""}
-        GROUP BY p.id, p.title, p.body, p.authorId, p.channelId, p.createdAt
-        ORDER BY score DESC, p.createdAt DESC
+        SELECT * FROM (
+          SELECT
+            'post' AS itemType,
+            p.id,
+            p.title,
+            p.body AS excerpt,
+            p.authorId,
+            p.createdAt,
+            COALESCE(SUM(v.value), 0) AS score
+          FROM posts p
+          LEFT JOIN vote v ON v.targetType = 'post' AND v.targetId = p.id
+          ${channelId ? "WHERE p.channelId = ?" : ""}
+          GROUP BY p.id, p.title, p.body, p.authorId, p.createdAt
+
+          UNION ALL
+
+          SELECT
+            'reply' AS itemType,
+            r.id,
+            NULL AS title,
+            r.body AS excerpt,
+            r.authorId,
+            r.createdAt,
+            COALESCE(SUM(v.value), 0) AS score
+          FROM reply r
+          LEFT JOIN vote v ON v.targetType = 'reply' AND v.targetId = r.id
+          GROUP BY r.id, r.body, r.authorId, r.createdAt
+        ) AS ranked
+        ORDER BY score DESC, createdAt DESC
         LIMIT ? OFFSET ?
       `;
       params = [];
@@ -1112,20 +1206,35 @@ app.get("/search", async (req, res) => {
       params.push(limit, offset);
     } else if (type === "lowest-ranked") {
       sql = `
-        SELECT
-          p.id,
-          p.title,
-          p.body,
-          p.authorId,
-          p.channelId,
-          p.createdAt,
-          COALESCE(SUM(v.value), 0) AS score
-        FROM posts p
-        LEFT JOIN vote v
-          ON v.targetType = 'post' AND v.targetId = p.id
-        ${channelId ? "WHERE p.channelId = ?" : ""}
-        GROUP BY p.id, p.title, p.body, p.authorId, p.channelId, p.createdAt
-        ORDER BY score ASC, p.createdAt DESC
+        SELECT * FROM (
+          SELECT
+            'post' AS itemType,
+            p.id,
+            p.title,
+            p.body AS excerpt,
+            p.authorId,
+            p.createdAt,
+            COALESCE(SUM(v.value), 0) AS score
+          FROM posts p
+          LEFT JOIN vote v ON v.targetType = 'post' AND v.targetId = p.id
+          ${channelId ? "WHERE p.channelId = ?" : ""}
+          GROUP BY p.id, p.title, p.body, p.authorId, p.createdAt
+
+          UNION ALL
+
+          SELECT
+            'reply' AS itemType,
+            r.id,
+            NULL AS title,
+            r.body AS excerpt,
+            r.authorId,
+            r.createdAt,
+            COALESCE(SUM(v.value), 0) AS score
+          FROM reply r
+          LEFT JOIN vote v ON v.targetType = 'reply' AND v.targetId = r.id
+          GROUP BY r.id, r.body, r.authorId, r.createdAt
+        ) AS ranked
+        ORDER BY score ASC, createdAt DESC
         LIMIT ? OFFSET ?
       `;
       params = [];
