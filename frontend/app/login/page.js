@@ -33,7 +33,7 @@ export default function LoginPage() {
       localStorage.setItem("token", data.token);
       localStorage.setItem("user", JSON.stringify(data.user));
 
-      router.push("/channels");
+      window.location.href = "/channels";
     } catch (err) {
       console.error(err);
       setError(err.message);
