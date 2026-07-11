@@ -1,4 +1,4 @@
-# Programming Q&A Tool
+# Programming Discussion Platform
 
 ## Overview
 
